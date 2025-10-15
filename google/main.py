@@ -16,8 +16,8 @@ JWT_EXPIRATION_HOURS = 24
 oauth = OAuth(app)
 google = oauth.register(
     name='google',
-    client_id='511897593718-ibeupfvqigdr5ljjoprircckfibcn05j.apps.googleusercontent.com',  # Replace with your Google Client ID
-    client_secret='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',  # Replace with your Google Client Secret
+    client_id='',  # Replace with your Google Client ID
+    client_secret='',  # Replace with your Google Client Secret
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={
         'scope': 'openid email profile'
