@@ -1,20 +1,50 @@
 from flask import Flask, redirect, url_for, session, request, jsonify
 from authlib.integrations.flask_client import OAuth
 import secrets
-import sqlite3
-from datetime import datetime, timedelta
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timedelta, UTC
 import jwt
 from functools import wraps
 import time
+import atexit
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)  # Change this in production!
-JWT_SECRET = secrets.token_hex(32)  # Change this in production!
+app.secret_key = secrets.token_hex(16)
+JWT_SECRET = secrets.token_hex(32)
 JWT_ALGORITHM = 'HS256'
-JWT_ACCESS_TOKEN_HOURS = 1  # Short-lived access token
-JWT_REFRESH_TOKEN_DAYS = 30  # Long-lived refresh token
+JWT_ACCESS_TOKEN_HOURS = 1
+JWT_REFRESH_TOKEN_DAYS = 30
 
-# Configure OAuth for Google WITH refresh token support
+# PostgreSQL Connection Configuration
+DATABASE_URL = "postgresql://whale:iC9_vZ0_jZ2-jN3_pX2+@asia-south2-001.proxy.kinsta.app:30219/semantic-amaranth-leopon"
+
+# Pool state
+db_pool = None
+pool_closed = False
+
+def init_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = pool.SimpleConnectionPool(1, 20, DATABASE_URL)
+        print("Connection pool initialized")
+
+def get_db_connection():
+    global db_pool
+    if db_pool is None:
+        init_pool()
+    return db_pool.getconn()
+
+def close_db_connection(conn):
+    global db_pool, pool_closed
+    if conn and db_pool and not pool_closed:
+        try:
+            db_pool.putconn(conn)
+        except Exception as e:
+            print(f"Error returning connection to pool: {e}")
+
+# Configure OAuth for Google
 oauth = OAuth(app)
 google = oauth.register(
     name='google',
@@ -23,49 +53,63 @@ google = oauth.register(
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={
         'scope': 'openid email profile',
-        'prompt': 'consent',  # Force consent screen to get refresh token
-        'access_type': 'offline'  # REQUEST REFRESH TOKEN!
+        'prompt': 'consent',
+        'access_type': 'offline'
     }
 )
 
-# Initialize database
 def init_db():
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            google_id TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            name TEXT,
-            given_name TEXT,
-            family_name TEXT,
-            avatar_url TEXT,
-            locale TEXT,
-            google_refresh_token TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            access_token TEXT UNIQUE NOT NULL,
-            refresh_token TEXT UNIQUE NOT NULL,
-            access_token_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            access_token_expires_at TIMESTAMP NOT NULL,
-            refresh_token_expires_at TIMESTAMP NOT NULL,
-            is_revoked INTEGER DEFAULT 0,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    
+    try:
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                google_id TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT,
+                given_name TEXT,
+                family_name TEXT,
+                avatar_url TEXT,
+                locale TEXT,
+                google_refresh_token TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        ''')
+        
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS tokens (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                access_token TEXT UNIQUE NOT NULL,
+                refresh_token TEXT UNIQUE NOT NULL,
+                access_token_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_token_expires_at TIMESTAMP NOT NULL,
+                refresh_token_expires_at TIMESTAMP NOT NULL,
+                is_revoked INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        c.execute('CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON tokens(user_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tokens_access_token ON tokens(access_token)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tokens_refresh_token ON tokens(refresh_token)')
+        
+        conn.commit()
+        print("Database initialized successfully!")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        conn.rollback()
+    finally:
+        c.close()
+        close_db_connection(conn)
 
+init_pool()
 init_db()
 
-# JWT Token Functions
 def generate_access_token(user_id, email):
     current_timestamp = int(time.time())
     payload = {
@@ -92,41 +136,48 @@ def generate_token_pair(user_id, email):
     access_token = generate_access_token(user_id, email)
     refresh_token = generate_refresh_token(user_id, email)
     
-    # Store both tokens in database
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    access_expires = datetime.utcnow() + timedelta(hours=JWT_ACCESS_TOKEN_HOURS)
-    refresh_expires = datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_DAYS)
     
-    c.execute('''INSERT INTO tokens 
-                 (user_id, access_token, refresh_token, access_token_expires_at, refresh_token_expires_at) 
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, access_token, refresh_token, access_expires, refresh_expires))
-    conn.commit()
-    conn.close()
+    try:
+        access_expires = datetime.now(UTC) + timedelta(hours=JWT_ACCESS_TOKEN_HOURS)
+        refresh_expires = datetime.now(UTC) + timedelta(days=JWT_REFRESH_TOKEN_DAYS)
+        
+        c.execute('''INSERT INTO tokens 
+                     (user_id, access_token, refresh_token, access_token_expires_at, refresh_token_expires_at) 
+                     VALUES (%s, %s, %s, %s, %s)''',
+                  (user_id, access_token, refresh_token, access_expires, refresh_expires))
+        conn.commit()
+    except Exception as e:
+        print(f"Error generating token pair: {e}")
+        conn.rollback()
+    finally:
+        c.close()
+        close_db_connection(conn)
     
     return access_token, refresh_token
 
 def verify_token(token, token_type='access'):
     try:
-        # Decode token with leeway
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], 
                            options={"verify_exp": True}, leeway=10)
         
-        # Verify token type
         if payload.get('type') != token_type:
             return None
         
-        # Check if token is revoked (for access tokens)
         if token_type == 'access':
-            conn = sqlite3.connect('ecommerce_users.db')
+            conn = get_db_connection()
             c = conn.cursor()
-            c.execute('SELECT is_revoked FROM tokens WHERE access_token = ?', (token,))
-            result = c.fetchone()
-            conn.close()
             
-            if not result or result[0] == 1:
-                return None
+            try:
+                c.execute('SELECT is_revoked FROM tokens WHERE access_token = %s', (token,))
+                result = c.fetchone()
+                
+                if not result or result[0] == 1:
+                    return None
+            finally:
+                c.close()
+                close_db_connection(conn)
         
         return payload
     except jwt.ExpiredSignatureError:
@@ -135,13 +186,19 @@ def verify_token(token, token_type='access'):
         return None
 
 def revoke_token_pair(access_token):
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('UPDATE tokens SET is_revoked = 1 WHERE access_token = ?', (access_token,))
-    conn.commit()
-    conn.close()
+    
+    try:
+        c.execute('UPDATE tokens SET is_revoked = 1 WHERE access_token = %s', (access_token,))
+        conn.commit()
+    except Exception as e:
+        print(f"Error revoking token: {e}")
+        conn.rollback()
+    finally:
+        c.close()
+        close_db_connection(conn)
 
-# Authentication decorator
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -170,65 +227,75 @@ def token_required(f):
     
     return decorated
 
-# Database helper functions
 def get_user_by_id(user_id):
-    conn = sqlite3.connect('ecommerce_users.db')
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return dict(user) if user else None
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        c.execute('SELECT * FROM users WHERE id = %s', (user_id,))
+        user = c.fetchone()
+        return dict(user) if user else None
+    finally:
+        c.close()
+        close_db_connection(conn)
 
 def get_user_by_google_id(google_id):
-    conn = sqlite3.connect('ecommerce_users.db')
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE google_id = ?', (str(google_id),))
-    user = c.fetchone()
-    conn.close()
-    return dict(user) if user else None
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        c.execute('SELECT * FROM users WHERE google_id = %s', (str(google_id),))
+        user = c.fetchone()
+        return dict(user) if user else None
+    finally:
+        c.close()
+        close_db_connection(conn)
 
 def create_or_update_user(google_id, email, name, given_name, family_name, avatar_url, locale, google_refresh_token=None):
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
-    c.execute('SELECT id FROM users WHERE google_id = ?', (str(google_id),))
-    existing_user = c.fetchone()
-    
-    if existing_user:
-        # Only update Google refresh token if we got a new one
-        if google_refresh_token:
-            c.execute('''
-                UPDATE users 
-                SET email = ?, name = ?, given_name = ?, family_name = ?, avatar_url = ?, 
-                    locale = ?, google_refresh_token = ?, last_login = ?
-                WHERE google_id = ?
-            ''', (email, name, given_name, family_name, avatar_url, locale, 
-                  google_refresh_token, datetime.now(), str(google_id)))
+    try:
+        c.execute('SELECT id FROM users WHERE google_id = %s', (str(google_id),))
+        existing_user = c.fetchone()
+        
+        if existing_user:
+            if google_refresh_token:
+                c.execute('''
+                    UPDATE users 
+                    SET email = %s, name = %s, given_name = %s, family_name = %s, avatar_url = %s, 
+                        locale = %s, google_refresh_token = %s, last_login = %s
+                    WHERE google_id = %s
+                ''', (email, name, given_name, family_name, avatar_url, locale, 
+                      google_refresh_token, datetime.now(UTC), str(google_id)))
+            else:
+                c.execute('''
+                    UPDATE users 
+                    SET email = %s, name = %s, given_name = %s, family_name = %s, avatar_url = %s, 
+                        locale = %s, last_login = %s
+                    WHERE google_id = %s
+                ''', (email, name, given_name, family_name, avatar_url, locale, 
+                      datetime.now(UTC), str(google_id)))
+            user_id = existing_user[0]
         else:
             c.execute('''
-                UPDATE users 
-                SET email = ?, name = ?, given_name = ?, family_name = ?, avatar_url = ?, 
-                    locale = ?, last_login = ?
-                WHERE google_id = ?
-            ''', (email, name, given_name, family_name, avatar_url, locale, 
-                  datetime.now(), str(google_id)))
-        user_id = existing_user[0]
-    else:
-        c.execute('''
-            INSERT INTO users (google_id, email, name, given_name, family_name, avatar_url, 
-                             locale, google_refresh_token, last_login)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (str(google_id), email, name, given_name, family_name, avatar_url, locale, 
-              google_refresh_token, datetime.now()))
-        user_id = c.lastrowid
-    
-    conn.commit()
-    conn.close()
-    return user_id
-
-# Routes - OAuth flow endpoints only, no frontend
+                INSERT INTO users (google_id, email, name, given_name, family_name, avatar_url, 
+                                 locale, google_refresh_token, last_login)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (str(google_id), email, name, given_name, family_name, avatar_url, locale, 
+                  google_refresh_token, datetime.now(UTC)))
+            user_id = c.fetchone()[0]
+        
+        conn.commit()
+        return user_id
+    except Exception as e:
+        print(f"Error creating/updating user: {e}")
+        conn.rollback()
+        raise
+    finally:
+        c.close()
+        close_db_connection(conn)
 
 @app.route('/login')
 def login():
@@ -239,11 +306,7 @@ def login():
 def authorize():
     try:
         token = google.authorize_access_token()
-        
-        # Get user info
         user_info = token.get('userinfo')
-        
-        # Get Google's refresh token (only provided on first authorization or when prompt=consent)
         google_refresh_token = token.get('refresh_token')
         
         if user_info:
@@ -258,7 +321,6 @@ def authorize():
                 google_refresh_token=google_refresh_token
             )
             
-            # Generate OUR token pair
             access_token, refresh_token = generate_token_pair(user_id, user_info['email'])
             
             session['user'] = {
@@ -274,7 +336,6 @@ def authorize():
                 'has_google_refresh_token': google_refresh_token is not None
             }
             
-            # Return JSON response with tokens instead of redirecting to home
             return jsonify({
                 'success': True,
                 'message': 'Authentication successful',
@@ -328,11 +389,9 @@ def profile():
     
     return jsonify({'error': 'User not found'}), 404
 
-# API Endpoints
 @app.route('/api/user', methods=['GET'])
 @token_required
 def api_user(user):
-    """Get current authenticated user"""
     return jsonify({
         'success': True,
         'user': {
@@ -350,45 +409,51 @@ def api_user(user):
 
 @app.route('/api/refresh', methods=['POST'])
 def api_refresh():
-    """Refresh access token using refresh token"""
     data = request.get_json() or {}
     refresh_token = data.get('refresh_token')
     
     if not refresh_token:
         return jsonify({'error': 'Refresh token is required'}), 400
     
-    # Verify refresh token
     payload = verify_token(refresh_token, 'refresh')
     if not payload:
         return jsonify({'error': 'Invalid or expired refresh token'}), 401
     
-    # Check if token is revoked
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT is_revoked FROM tokens WHERE refresh_token = ?', (refresh_token,))
-    result = c.fetchone()
-    conn.close()
     
-    if not result or result[0] == 1:
-        return jsonify({'error': 'Refresh token has been revoked'}), 401
+    try:
+        c.execute('SELECT is_revoked FROM tokens WHERE refresh_token = %s', (refresh_token,))
+        result = c.fetchone()
+        
+        if not result or result[0] == 1:
+            return jsonify({'error': 'Refresh token has been revoked'}), 401
+    finally:
+        c.close()
+        close_db_connection(conn)
     
-    # Generate new access token (keep same refresh token)
     user = get_user_by_id(payload['user_id'])
     if not user:
         return jsonify({'error': 'User not found'}), 401
     
     new_access_token = generate_access_token(user['id'], user['email'])
     
-    # Update access token in database
-    conn = sqlite3.connect('ecommerce_users.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    new_access_expires = datetime.utcnow() + timedelta(hours=JWT_ACCESS_TOKEN_HOURS)
-    c.execute('''UPDATE tokens 
-                 SET access_token = ?, access_token_created_at = ?, access_token_expires_at = ?
-                 WHERE refresh_token = ?''',
-              (new_access_token, datetime.utcnow(), new_access_expires, refresh_token))
-    conn.commit()
-    conn.close()
+    
+    try:
+        new_access_expires = datetime.now(UTC) + timedelta(hours=JWT_ACCESS_TOKEN_HOURS)
+        c.execute('''UPDATE tokens 
+                     SET access_token = %s, access_token_created_at = %s, access_token_expires_at = %s
+                     WHERE refresh_token = %s''',
+                  (new_access_token, datetime.now(UTC), new_access_expires, refresh_token))
+        conn.commit()
+    except Exception as e:
+        print(f"Error updating token: {e}")
+        conn.rollback()
+    finally:
+        c.close()
+        close_db_connection(conn)
     
     return jsonify({
         'success': True,
@@ -400,15 +465,25 @@ def api_refresh():
 @app.route('/api/logout', methods=['POST'])
 @token_required
 def api_logout(user):
-    """Revoke current token pair"""
     token = request.headers['Authorization'].split(' ')[1]
     revoke_token_pair(token)
     return jsonify({'success': True, 'message': 'Tokens revoked successfully'})
 
 @app.route('/api/health', methods=['GET'])
 def api_health():
-    """Public endpoint to check API health"""
     return jsonify({'status': 'ok', 'message': 'API is running'})
+
+def close_pool_on_exit():
+    global db_pool, pool_closed
+    if db_pool and not pool_closed:
+        try:
+            db_pool.closeall()
+            pool_closed = True
+            print("Connection pool closed")
+        except Exception as ex:
+            print(f"Error closing pool: {ex}")
+
+atexit.register(close_pool_on_exit)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
