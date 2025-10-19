@@ -1,23 +1,27 @@
 from flask import Flask, redirect, url_for, session, request, jsonify
 from authlib.integrations.flask_client import OAuth
-import secrets
 import sqlite3
 from datetime import datetime, timedelta
 import jwt
 from functools import wraps
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)  # Change this in production!
-JWT_SECRET = secrets.token_hex(32)  # Change this in production!
-JWT_ALGORITHM = 'HS256'
-JWT_EXPIRATION_HOURS = 24
+app.secret_key = os.getenv('FLASK_SECRET_KEY')
+JWT_SECRET = os.getenv('JWT_SECRET')
+JWT_ALGORITHM = os.getenv('JWT_ALGORITHM', 'HS256')
+JWT_EXPIRATION_HOURS = int(os.getenv('JWT_EXPIRATION_HOURS', 24))
 
 # Configure OAuth
 oauth = OAuth(app)
 github = oauth.register(
     name='github',
-    client_id='Ov23liHq8cDpV0s6fJja',
-    client_secret='1ea6ef011a7a80634ada3a88a1133de0d9e50d1f',
+    client_id=os.getenv('GITHUB_CLIENT_ID'),
+    client_secret=os.getenv('GITHUB_CLIENT_SECRET'),
     access_token_url='https://github.com/login/oauth/access_token',
     access_token_params=None,
     authorize_url='https://github.com/login/oauth/authorize',
