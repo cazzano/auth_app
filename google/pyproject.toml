@@ -10,7 +10,8 @@ dependencies = [
 " requests",
 "PyJWT",
 "psycopg2-binary",
-"psycopg2-pool"
+"psycopg2-pool",
+"python-dotenv"
 
 
 ]
